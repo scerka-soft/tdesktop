@@ -222,7 +222,7 @@ using BigNumContext = openssl::Context;
 	} ClosePermutation();
 	G(3);
 	S("\x00\x01\x00"_q);
-	P();
+	P(); // Padding block - now generates random size
 	CloseScope();
 	CloseScope();
 	CloseScope();
@@ -510,13 +510,42 @@ void Generator::Part::writeBlock(const MTPDtlsBlockE &data) {
 	writeBlock(MTP_tlsBlockRandom(MTP_int(length)));
 }
 
+// ============================================================
+// UPDATED: Random padding generation
+// ============================================================
 void Generator::Part::writeBlock(const MTPDtlsBlockPadding &data) {
-	const auto length = int(_result.size());
-	if (length < 513) {
-		const auto zero = MTP_tlsBlockZero(MTP_int(513 - length));
-		writeBlock(MTP_tlsBlockString(MTP_bytes("\x00\x15"_q)));
-		writeBlock(MTP_tlsBlockScope(MTP_vector<MTPTlsBlock>(1, zero)));
+	// F5 and similar DPI devices look for 513-byte ClientHello as a fingerprint.
+	// Randomize padding target per connection to avoid deterministic patterns.
+	// 
+	// Why 512-562 range:
+	// - Minimum 512: Above F5 511-byte detection threshold
+	// - Maximum 562: Enough variation, keeps packet sizes reasonable
+	// - Real TLS ClientHello often ranges 500-550 bytes
+	constexpr int kMinPaddingTarget = 512;
+	constexpr int kMaxPaddingTarget = 562;
+	
+	const auto currentSize = int(_result.size());
+	
+	// Generate random target size for this connection
+	const auto rangeSize = kMaxPaddingTarget - kMinPaddingTarget + 1;
+	const auto targetSize = kMinPaddingTarget + 
+		static_cast<int>(base::RandomIndex(rangeSize));
+	
+	// Add padding if current size is below target
+	if (currentSize < targetSize) {
+		const auto needed = targetSize - currentSize;
+		
+		// Write as TLS padding extension (type 0x0015)
+		// Format: [extension_type:2] [length:2] [padding_data]
+		const auto paddingType = "\x00\x15"_q; // TLS padding extension
+		const auto zeroBlock = MTP_tlsBlockZero(MTP_int(needed));
+		const auto scope = MTP_tlsBlockScope(MTP_vector<MTPTlsBlock>(1, zeroBlock));
+		
+		writeBlock(MTP_tlsBlockString(MTP_bytes(paddingType)));
+		writeBlock(scope);
 	}
+	// If already larger than target, don't add padding
+	// This is normal for complex ClientHello with many extensions
 }
 
 void Generator::Part::finalize(bytes::const_span key) {
